@@ -1,24 +1,15 @@
 import requests
 import json
-import logging.handlers
 from flask import Flask
 from flask import request
+from datetime import datetime
 
 app = Flask(__name__)
 
-
-handler = logging.handlers.RotatingFileHandler(
-    filename="/data/logs/webhook.log",
-    maxBytes=10240 * 1024,
-    backupCount=2,
-    encoding='UTF-8'
-)
-handler.setLevel(logging.DEBUG)
-handler.setFormatter(logging.Formatter('%(asctime)s pid:%(process)d %(filename)s:%(lineno)d %(levelname)s %(message)s'))
-app.logger.addHandler(handler)
+Admin = "zhouhuang"
 
 
-def send_requests(method="get", url=None, headers=None, params=None, payload=None, timeout=20):
+def http_requests(method="get", url=None, headers=None, params=None, payload=None, timeout=10):
     """发送http请求"""
     try:
         resp = requests.request(
@@ -48,7 +39,17 @@ def send_requests(method="get", url=None, headers=None, params=None, payload=Non
         return 1, str(error)
 
 
-@app.route('/api/grafana/alerts', methods=['POST', 'put'])
+def reliao_notify(user, content):
+    url = "http://game-msg-center.online.qiyi.qae/send/hotchat/alter/txt-msg"
+    headers = {"Content-Type": "application/json"}
+    payload = {"to": user, "msg": content}
+    code, msg = http_requests(method="post", url=url, headers=headers, payload=json.dumps(payload))
+    if code == 1:
+        return "not ok"
+    return 'ok'
+
+
+@app.route('/api/grafana/alerts', methods=['POST', 'PUT'])
 def grafana_alerts():
     """
     # http://docs.jinkan.org/docs/flask/api.html#id4
@@ -72,37 +73,29 @@ def grafana_alerts():
     :return:
     """
     json_body = request.json
-    app.logger.info(json_body)
     title = json_body["title"]
-    rule_id = json_body["ruleId"]
     rule_name = json_body["ruleName"]
-    rule_url = json_body["ruleUrl"]
     state = json_body["state"]
-    # 可能未指定图片
-    try:
-        image_url = json_body["imageUrl"]
-    except:
-        image_url = None
     message = json_body["message"]
     matches = json_body["evalMatches"]
+    start_at = datetime.now().strftime( '%Y-%m-%d %H:%M:%S')
 
     content = "【Grafana告警】\n"
-    content += "报警主题 = {}\n".format(title)
-    content += "报警触发规则 = {}\n".format(rule_name)
-    content += "状态 = {}\n".format(state)
-    content += "message = {}\n".format(message)
-    content += "当前数值信息\n"
+    content += "[告警状态]: {}\n".format(state)
+    content += "[告警主题]: {}\n".format(title)
+    content += "[详情描述]: {}\n".format(message)
+    content += "[触发规则]: {}\n".format(rule_name)
+    content += "[告警时间]: {}\n".format(start_at)
+    content += "[数值详情]:\n"
     for i in matches:
-        content += "    {} = {}".format(i["metric"], i["value"])
+        content += "{} = {}\n".format(i["metric"], i["value"])
 
-    url = "http://game-msg-center.online.qiyi.qae/send/hotchat/alter/txt-msg"
-    headers = {"Content-Type": "application/json"}
-    payload = {"to": "zhouhuang,hujun", "msg": content}
-    send_requests(method="post", url=url, headers=headers, payload=json.dumps(payload))
+    user = request.args.get('user', "zhouhuang")
+    reliao_notify(user=user, content=content)
     return 'ok'
 
 
-@app.route('/api/prometheus/alerts', methods=['POST', 'put'])
+@app.route('/api/prometheus/alerts', methods=['POST', 'PUT'])
 def prometheus_alerts():
     """
     prometheus alertmamager webhook接口
@@ -132,32 +125,49 @@ def prometheus_alerts():
     :return:
     """
     json_body = request.json
-    app.logger.info(json_body)
-    alerts = json_body["alerts"]
-    content = "【Prometheus告警】\n"
+    status = json_body["status"]
+    alerts = json_body["alerts"]  # 详细告警列表
+    count = 0
+    content = ""
     for i in alerts:
-        status = i["status"]   # 状态
-        lables = i["labels"]  # 标签dict
-        annotations = i["annotations"]  # 描述dict  key: description, summary
-        starts_at = i["startsAt"]  # 开始时间
-        ends_at = i["endsAt"]   # 结束时间
-        generator_url = i["generatorURL"]  # 报警uri查看地址
+        if status != i["status"]:
+            continue
+        # generator_url = i["generatorURL"]  # 报警uri查看地址
+        # annotations = i["annotations"]     # 描述dict  key: description, summary
+        try:
+            lables = i["labels"]               # 标签dict
+            summary = i["annotations"]["summary"]  # 告警主题
+            description = i["annotations"]["description"]  # 告警描述
+            starts_at = i["startsAt"]          # 开始时间
+            ends_at = i["endsAt"]              # 结束时间
+            content += "[告警状态]: {}\n".format(status)
+            content += "[告警主题]: {}\n".format(summary)
+            content += "[告警描述]: {}\n".format(description)
+            for k, v in lables.items():
+                if k in ["alertname", "consul_address", "consul_dc"]:
+                    continue
+                content += "{} = {}\n".format(k, v)
+            content += "[开始时间]: {}\n".format(starts_at)
+            content += "[结束时间]: {}\n".format(ends_at)
+            content += "\n"
+            count += 1
+        except KeyError as err:
+            ## 异常处理
+            reliao_notify(user=Admin,
+                          content="Alertmanager webhook faild, info: {} key not find. alerts: {}".format(err, alerts))
 
-        content += "[status]: {}\n".format(status)
-        content += "[description]: {}\n".format(annotations["description"])
-        content += "[summary]: {}\n".format(annotations["summary"])
-        content += "[Lables]:\n"
-        for k, v in lables.items():
-            content += "{} = {}\n".format(k, v)
-        content += "[开始时间]: {}\n".format(starts_at)
-        content += "[结束时间]: {}\n".format(ends_at)
-        content += "[链接]: {}\n\n".format(generator_url)
+    if count > 3 and status == "firing":
+        content += "注意! 本次共产生{}条报警,请多留意!".format(count)
 
-    user = request.args.get('user', "zhouhuang")
-    url = "http://game-msg-center.online.qiyi.qae/send/hotchat/alter/txt-msg"
-    headers = {"Content-Type": "application/json"}
-    payload = {"to": user, "msg": content}
-    send_requests(method="post", url=url, headers=headers, payload=json.dumps(payload))
+    if count > 0:
+        title = "【告警通知】\n"
+        user = request.args.get('user', "zhouhuang")
+        reliao_notify(user=user, content=title + content)
+    return 'ok'
+
+
+@app.route('/api/prometheus/alerts', methods=['GET'])
+def get_prometheus_alerts():
     return 'ok'
 
 
